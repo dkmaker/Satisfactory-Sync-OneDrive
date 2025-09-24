@@ -47,12 +47,7 @@ if (!(Test-Path $SourceScriptPath)) {
     exit 1
 }
 
-$SourceVBSValidation = Join-Path $PSScriptRoot "Sync-SatisfactoryBlueprints.vbs"
-if (!(Test-Path $SourceVBSValidation)) {
-    Write-Error "VBScript wrapper not found at: $SourceVBSValidation"
-    Write-Host "The VBScript wrapper is required for silent task execution." -ForegroundColor Yellow
-    exit 1
-}
+# VBScript wrapper is generated dynamically, no template file needed
 
 # Create installation directory if it doesn't exist
 Write-Host "Setting up installation directory..." -ForegroundColor Yellow
@@ -61,12 +56,11 @@ if (!(Test-Path $InstallPath)) {
     Write-Host "Created installation directory: $InstallPath" -ForegroundColor Green
 }
 
-# Copy script and VBScript wrapper to installation directory
+# Copy script and generate VBScript wrapper
 $ScriptFileName = "Sync-SatisfactoryBlueprints.ps1"
 $ScriptPath = Join-Path $InstallPath $ScriptFileName
 $VBSFileName = "Sync-SatisfactoryBlueprints.vbs"
 $VBSPath = Join-Path $InstallPath $VBSFileName
-$SourceVBSPath = Join-Path $PSScriptRoot $VBSFileName
 
 Write-Host "Copying sync script and creating customized VBScript wrapper..." -ForegroundColor Yellow
 Copy-Item -Path $SourceScriptPath -Destination $ScriptPath -Force
