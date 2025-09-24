@@ -2,7 +2,7 @@
 
 [![PowerShell](https://img.shields.io/badge/PowerShell-5.1%2B-blue.svg)](https://learn.microsoft.com/en-us/powershell/)
 [![Windows](https://img.shields.io/badge/Platform-Windows%2010%2F11-blue.svg)](https://www.microsoft.com/windows)
-[![Satisfactory](https://img.shields.io/badge/Satisfactory-1.0-orange.svg)](https://www.satisfactorygame.com/)
+[![Satisfactory](https://img.shields.io/badge/Satisfactory-1.1-orange.svg)](https://www.satisfactorygame.com/)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
 Automated bidirectional synchronization of Satisfactory blueprints with OneDrive, featuring version history, conflict resolution, and multi-device support.
