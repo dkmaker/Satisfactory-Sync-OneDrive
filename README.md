@@ -1,6 +1,6 @@
 # Satisfactory Blueprint Sync for OneDrive
 
-[![PowerShell](https://img.shields.io/badge/PowerShell-7.0%2B-blue.svg)](https://github.com/PowerShell/PowerShell)
+[![PowerShell](https://img.shields.io/badge/PowerShell-5.1%2B-blue.svg)](https://learn.microsoft.com/en-us/powershell/)
 [![Windows](https://img.shields.io/badge/Platform-Windows%2010%2F11-blue.svg)](https://www.microsoft.com/windows)
 [![Satisfactory](https://img.shields.io/badge/Satisfactory-1.0-orange.svg)](https://www.satisfactorygame.com/)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
@@ -15,8 +15,10 @@ Satisfactory blueprints are **not** synchronized to Steam Cloud. This solution:
 - **Bidirectional sync** between local Satisfactory folder and OneDrive
 - **Version history** with up to 10 versions per file stored in backups
 - **Conflict resolution** by keeping the newest file based on timestamps
-- **Multi-device support** with per-device tracking and global file state
-- **Smart backup** for both deletions and overwrites in OneDrive
+- **Multi-device support** with file-centric tracking and global file state
+- **Enhanced deletion handling** with immediate OneDrive cleanup and cross-device propagation
+- **Smart backup** for all conflicts, overwrites, and deletions with comprehensive coverage
+- **Companion file coordination** - .sbp and .sbpcfg files handled together
 - **Automatic OneDrive pinning** to ensure files are always available offline
 
 ## Features
@@ -33,8 +35,9 @@ Satisfactory blueprints are **not** synchronized to Steam Cloud. This solution:
 
 - **Intelligent Conflict Resolution**:
   - Compares file timestamps when both changed
-  - Backs up the older version before overwrite
+  - Backs up the losing version before overwrite
   - Preserves all file timestamps during copy operations
+  - Clear conflict logging with backup tracking
 
 - **OneDrive Integration**:
   - Automatically pins folder for offline availability
@@ -48,7 +51,7 @@ Satisfactory blueprints are **not** synchronized to Steam Cloud. This solution:
 ### Prerequisites
 
 - Windows 10/11
-- PowerShell 7.0 or later ([Download](https://github.com/PowerShell/PowerShell/releases))
+- Windows PowerShell 5.1 (built into Windows 10/11)
 - OneDrive configured and running
 - Administrator privileges (for scheduled task installation)
 - [Satisfactory](https://store.steampowered.com/app/526870/Satisfactory/) installed
@@ -63,7 +66,11 @@ Satisfactory blueprints are **not** synchronized to Steam Cloud. This solution:
 
 2. **Run the installer as Administrator**
    ```powershell
-   # Open PowerShell 7 as Administrator
+   # Open Windows PowerShell as Administrator
+   # Set execution policy for current process (if needed)
+   Set-ExecutionPolicy -ExecutionPolicy Bypass -Scope Process
+
+   # Run the installer
    .\Install-SyncScheduledTask.ps1
    ```
 
@@ -106,47 +113,51 @@ OneDrive\Documents\Satisfactory\
    - Each version includes hash, timestamp, device, and backup location
    - Older versions automatically pruned (FIFO)
 
-4. **Deletion Handling**:
-   - When a file is deleted, checks if other devices still have it
-   - If no other device has the file, backs up then removes from OneDrive
+4. **Enhanced Deletion Handling**:
+   - Detects deletions by comparing device's previous file list vs current scan
+   - Immediately removes deleted files from OneDrive with backup
+   - Handles companion files (.sbp/.sbpcfg) together during deletion
+   - Cross-device deletion propagation ensures consistency
+   - Supports file re-creation with same name (fresh lifecycle)
    - All backups stored in `blueprints_backup/[timestamp]/` folders
 
 ## Metadata Structure
 
 ```json
 {
-  "version": "1.0",
+  "version": "2.0",
   "lastUpdated": "2025-01-24T10:00:00Z",
+  "files": {
+    "First Factory/Blueprint1.sbp": {
+      "fileId": "uuid-1234-5678-9abc",
+      "globalStatus": "active",
+      "deletedBy": null,
+      "deletedTimestamp": null,
+      "lastKnownHash": "SHA256...",
+      "devices": {
+        "DESKTOP-ABC123": {
+          "status": "active",
+          "hash": "SHA256...",
+          "lastModified": "2025-01-24T10:00:00Z",
+          "lastSeen": "2025-01-24T10:00:00Z"
+        }
+      },
+      "versions": [
+        {
+          "hash": "SHA256...",
+          "timestamp": "2025-01-24T10:00:00Z",
+          "device": "DESKTOP-ABC123",
+          "action": "create"
+        }
+      ]
+    }
+  },
   "devices": {
     "DESKTOP-ABC123": {
       "lastSync": "2025-01-24T10:00:00Z",
-      "files": {
-        "First Factory/Blueprint1.sbp": {
-          "current": {
-            "hash": "SHA256...",
-            "lastModified": "2025-01-24T10:00:00Z",
-            "size": 2048
-          },
-          "versions": [
-            {
-              "hash": "SHA256_OLD...",
-              "lastModified": "2025-01-24T09:00:00Z",
-              "size": 1024,
-              "deviceId": "LAPTOP-XYZ789",
-              "action": "overwrite",
-              "backupPath": "blueprints_backup/20250124090000/First Factory/Blueprint1.sbp",
-              "timestamp": "2025-01-24T09:30:00Z"
-            }
-          ]
-        }
+      "lastKnownFiles": {
+        "First Factory/Blueprint1.sbp": "SHA256..."
       }
-    }
-  },
-  "globalFiles": {
-    "First Factory/Blueprint1.sbp": {
-      "latestHash": "SHA256...",
-      "latestModified": "2025-01-24T10:00:00Z",
-      "latestDevice": "DESKTOP-ABC123"
     }
   }
 }
@@ -176,19 +187,22 @@ Unregister-ScheduledTask -TaskName 'SatisfactoryBlueprintSync' -Confirm:$false
 To run the sync manually without the scheduled task:
 ```powershell
 # Default bidirectional sync
-pwsh.exe -ExecutionPolicy Bypass -File "C:\Scripts\SatisfactorySync\Sync-SatisfactoryBlueprints.ps1"
+powershell.exe -ExecutionPolicy Bypass -File "C:\Scripts\SatisfactorySync\Sync-SatisfactoryBlueprints.ps1"
 
 # Push only (local to cloud)
-pwsh.exe -ExecutionPolicy Bypass -File "C:\Scripts\SatisfactorySync\Sync-SatisfactoryBlueprints.ps1" -SyncMode LocalToCloud
+powershell.exe -ExecutionPolicy Bypass -File "C:\Scripts\SatisfactorySync\Sync-SatisfactoryBlueprints.ps1" -SyncMode LocalToCloud
 
 # Pull only (cloud to local)
-pwsh.exe -ExecutionPolicy Bypass -File "C:\Scripts\SatisfactorySync\Sync-SatisfactoryBlueprints.ps1" -SyncMode CloudToLocal
+powershell.exe -ExecutionPolicy Bypass -File "C:\Scripts\SatisfactorySync\Sync-SatisfactoryBlueprints.ps1" -SyncMode CloudToLocal
 
 # Skip OneDrive pinning
-pwsh.exe -ExecutionPolicy Bypass -File "C:\Scripts\SatisfactorySync\Sync-SatisfactoryBlueprints.ps1" -SkipOneDrivePinning
+powershell.exe -ExecutionPolicy Bypass -File "C:\Scripts\SatisfactorySync\Sync-SatisfactoryBlueprints.ps1" -SkipOneDrivePinning
 
 # Custom version history limit (default is 10)
-pwsh.exe -ExecutionPolicy Bypass -File "C:\Scripts\SatisfactorySync\Sync-SatisfactoryBlueprints.ps1" -MaxVersionHistory 20
+powershell.exe -ExecutionPolicy Bypass -File "C:\Scripts\SatisfactorySync\Sync-SatisfactoryBlueprints.ps1" -MaxVersionHistory 20
+
+# Or use the VBScript wrapper for silent execution
+wscript.exe "C:\Scripts\SatisfactorySync\Sync-SatisfactoryBlueprints.vbs"
 ```
 
 ## Troubleshooting
@@ -196,7 +210,7 @@ pwsh.exe -ExecutionPolicy Bypass -File "C:\Scripts\SatisfactorySync\Sync-Satisfa
 ### Sync not running
 1. Check task status: `Get-ScheduledTask -TaskName 'SatisfactoryBlueprintSync'`
 2. Review logs at: `$env:OneDrive\Documents\Satisfactory\logs\`
-3. Verify PowerShell 7 is installed: `pwsh --version`
+3. Verify Windows PowerShell is available: `powershell.exe -Command "Get-Host"`
 
 ### Files not syncing
 1. Check source folder exists: `%LocalAppData%\FactoryGame\Saved\SaveGames\blueprints\`
@@ -223,7 +237,7 @@ pwsh.exe -ExecutionPolicy Bypass -File "C:\Scripts\SatisfactorySync\Sync-Satisfa
 - Each blueprint consists of two files: `.sbp` (data) and `.sbpcfg` (config)
 - Save game folders are created automatically as needed
 - Empty folders are cleaned up automatically
-- The scheduled task uses S4U logon type (no manual "Run now" but prevents window popups)
+- The scheduled task uses Interactive logon with VBScript wrapper for completely silent execution
 
 ## 🤝 Contributing
 

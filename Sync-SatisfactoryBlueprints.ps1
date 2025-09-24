@@ -1,4 +1,4 @@
-#Requires -Version 7.0
+#Requires -Version 5.1
 <#
 .SYNOPSIS
     Bidirectional sync of Satisfactory blueprints with OneDrive, version history, and conflict resolution
@@ -77,8 +77,8 @@ function Rotate-Logs {
                 Write-Log "Removed old log file: $($oldLog.Name)"
             }
 
-            if ($oldLogs.Count -gt 0) {
-                Write-Log "Rotated $($oldLogs.Count) old log file(s)"
+            if ($oldLogs -and (@($oldLogs).Count -gt 0)) {
+                Write-Log "Rotated $(@($oldLogs).Count) old log file(s)"
             }
         }
     }
@@ -87,12 +87,76 @@ function Rotate-Logs {
     }
 }
 
+# Convert PSCustomObject to hashtable recursively
+function ConvertTo-Hashtable {
+    param([PSObject]$InputObject)
+
+    if ($null -eq $InputObject) {
+        return $null
+    }
+
+    if ($InputObject -is [PSCustomObject]) {
+        $hashtable = @{}
+        $InputObject.PSObject.Properties | ForEach-Object {
+            if ($_.Value -is [PSCustomObject]) {
+                $hashtable[$_.Name] = ConvertTo-Hashtable -InputObject $_.Value
+            }
+            elseif ($_.Value -is [Array]) {
+                $hashtable[$_.Name] = @()
+                foreach ($item in $_.Value) {
+                    if ($item -is [PSCustomObject]) {
+                        $hashtable[$_.Name] += ConvertTo-Hashtable -InputObject $item
+                    }
+                    else {
+                        $hashtable[$_.Name] += $item
+                    }
+                }
+            }
+            else {
+                $hashtable[$_.Name] = $_.Value
+            }
+        }
+        return $hashtable
+    }
+    elseif ($InputObject -is [Array]) {
+        $array = @()
+        foreach ($item in $InputObject) {
+            if ($item -is [PSCustomObject]) {
+                $array += ConvertTo-Hashtable -InputObject $item
+            }
+            else {
+                $array += $item
+            }
+        }
+        return $array
+    }
+    else {
+        return $InputObject
+    }
+}
+
 # Load or initialize metadata
 function Get-Metadata {
     if (Test-Path $script:Config.MetadataPath) {
         try {
-            $content = Get-Content -Path $script:Config.MetadataPath -Raw | ConvertFrom-Json -AsHashtable
-            return $content
+            $jsonContent = Get-Content -Path $script:Config.MetadataPath -Raw | ConvertFrom-Json
+            # Convert PSCustomObject to hashtable for PowerShell 5.1 compatibility
+            $hashtable = ConvertTo-Hashtable -InputObject $jsonContent
+
+            # Check if this is V2.0 metadata structure
+            if (!$hashtable.ContainsKey('version') -or $hashtable.version -ne "2.0") {
+                Write-Log "Detected old metadata format. Initializing new V2.0 structure (old metadata will be backed up)" -Level Warning
+
+                # Backup old metadata
+                $backupPath = $script:Config.MetadataPath -replace '\.json$', "_backup_$(Get-Date -Format 'yyyyMMddHHmmss').json"
+                Copy-Item -Path $script:Config.MetadataPath -Destination $backupPath -Force
+                Write-Log "Old metadata backed up to: $backupPath" -Level Info
+
+                # Return fresh V2.0 structure
+                return Initialize-Metadata
+            }
+
+            return $hashtable
         }
         catch {
             Write-Log "Error loading metadata: $_" -Level Error
@@ -104,19 +168,19 @@ function Get-Metadata {
     }
 }
 
-# Initialize new metadata structure
+# Initialize new file-centric metadata structure V2.0
 function Initialize-Metadata {
     $metadata = @{
-        version = "1.0"
+        version = "2.0"
         lastUpdated = (Get-Date -Format 'o')
+        files = @{}
         devices = @{}
-        globalFiles = @{}
     }
 
-    # Initialize current device
+    # Initialize current device (simplified - only stores sync info)
     $metadata.devices[$script:Config.DeviceId] = @{
         lastSync = (Get-Date -Format 'o')
-        files = @{}
+        lastKnownFiles = @{} # Tracks what files this device had in previous sync
     }
 
     return $metadata
@@ -138,23 +202,53 @@ function Ensure-OneDriveAvailability {
             Write-Log "Created OneDrive folder: $folderPath"
         }
 
-        # Check if already pinned (has the P attribute)
-        $item = Get-Item $folderPath -Force -ErrorAction Stop
-        $isPinned = $item.Attributes -band [System.IO.FileAttributes]::Pinned
+        # Check if we're actually in a OneDrive folder
+        if ($folderPath -notlike "*\OneDrive*") {
+            Write-Log "Warning: Path doesn't appear to be in OneDrive: $folderPath" -Level Warning
+            return
+        }
 
-        if (-not $isPinned) {
-            Write-Log "Pinning OneDrive folder for offline availability: $folderPath"
-            # Pin the folder and all subfolders/files
-            $result = & attrib +P "$folderPath" /S /D 2>&1
-            if ($LASTEXITCODE -eq 0) {
-                Write-Log "Successfully pinned OneDrive folder"
-            }
-            else {
-                Write-Log "Warning: Could not pin OneDrive folder. Error: $result" -Level Warning
-            }
+        Write-Log "Pinning OneDrive folder and ALL contents recursively for offline availability: $folderPath"
+
+        # Pin ALL existing files and folders recursively using lowercase +p
+        # Note: OneDrive Files On-Demand uses lowercase attributes: +p for pinned, +u for unpinned
+        $result = & attrib +p "$folderPath\*" /S /D 2>&1
+
+        if ($LASTEXITCODE -eq 0) {
+            # Pin the root folder itself to ensure new files inherit the pinned state
+            & attrib +p "$folderPath" 2>&1 | Out-Null
+            Write-Log "Successfully pinned OneDrive folder recursively for complete offline availability: $folderPath"
         }
         else {
-            Write-Log "OneDrive folder already pinned for offline availability"
+            Write-Log "Warning: Could not pin all OneDrive content. Trying alternative approach..." -Level Warning
+            Write-Log "Error: $result" -Level Warning
+
+            # Fallback 1: Try pinning root folder with recursive flag
+            $fallbackResult = & attrib +p "$folderPath" /S /D 2>&1
+            if ($LASTEXITCODE -eq 0) {
+                Write-Log "Successfully pinned OneDrive folder with fallback method"
+            }
+            else {
+                Write-Log "Fallback method also failed. Trying individual subfolder approach..." -Level Warning
+
+                # Fallback 2: Pin individual subfolders recursively
+                $subFolders = @($script:Config.BlueprintsPath, $script:Config.BackupPath, $script:Config.LogPath)
+                foreach ($subFolder in $subFolders) {
+                    if (Test-Path $subFolder) {
+                        # Pin all content in subfolder
+                        & attrib +p "$subFolder\*" /S /D 2>$null
+                        # Pin the subfolder itself
+                        & attrib +p "$subFolder" 2>$null
+
+                        if ($LASTEXITCODE -eq 0) {
+                            Write-Log "Successfully pinned all content in subfolder: $subFolder"
+                        }
+                        else {
+                            Write-Log "Could not fully pin subfolder: $subFolder" -Level Warning
+                        }
+                    }
+                }
+            }
         }
     }
     catch {
@@ -189,12 +283,41 @@ function Get-FileHashString {
     param([string]$FilePath)
 
     try {
+        if (!(Test-Path $FilePath)) {
+            Write-Log "Cannot hash non-existent file: $FilePath" -Level Warning
+            return $null
+        }
+
         $hash = Get-FileHash -Path $FilePath -Algorithm SHA256
         return $hash.Hash
     }
     catch {
         Write-Log "Error hashing file $FilePath : $_" -Level Warning
         return $null
+    }
+}
+
+# Copy file with timestamp preservation
+function Copy-FileWithTimestamps {
+    param(
+        [string]$SourcePath,
+        [string]$DestinationPath
+    )
+
+    try {
+        $sourceItem = Get-Item $SourcePath
+        Copy-Item -Path $SourcePath -Destination $DestinationPath -Force
+
+        $destItem = Get-Item $DestinationPath
+        $destItem.CreationTime = $sourceItem.CreationTime
+        $destItem.LastWriteTime = $sourceItem.LastWriteTime
+        $destItem.LastAccessTime = $sourceItem.LastAccessTime
+
+        return $true
+    }
+    catch {
+        Write-Log "Error copying file with timestamps: $_" -Level Error
+        return $false
     }
 }
 
@@ -249,22 +372,75 @@ function Backup-FileVersion {
     }
 }
 
-# Add version to history array
-function Add-ToVersionHistory {
+# Get or create file entry in file-centric metadata
+function Get-FileEntry {
     param(
-        [hashtable]$FileEntry,
-        [hashtable]$VersionInfo
+        [hashtable]$Metadata,
+        [string]$RelativePath
     )
 
-    if (!$FileEntry.ContainsKey('versions')) {
-        $FileEntry.versions = @()
+    if (!$Metadata.files.ContainsKey($RelativePath)) {
+        $Metadata.files[$RelativePath] = @{
+            fileId = [System.Guid]::NewGuid().ToString()
+            globalStatus = "active"
+            deletedBy = $null
+            deletedTimestamp = $null
+            lastKnownHash = $null
+            devices = @{}
+            versions = @()
+        }
     }
 
-    # Add new version
-    $FileEntry.versions += $VersionInfo
+    return $Metadata.files[$RelativePath]
+}
+
+# Update device status for a specific file
+function Set-DeviceFileStatus {
+    param(
+        [hashtable]$FileEntry,
+        [string]$DeviceId,
+        [string]$Status,           # "active", "deleted", "never-had"
+        [string]$Hash = $null,
+        [string]$LastModified = $null
+    )
+
+    if (!$FileEntry.devices.ContainsKey($DeviceId)) {
+        $FileEntry.devices[$DeviceId] = @{}
+    }
+
+    $FileEntry.devices[$DeviceId].status = $Status
+    $FileEntry.devices[$DeviceId].lastSeen = (Get-Date -Format 'o')
+
+    if ($Hash) {
+        $FileEntry.devices[$DeviceId].hash = $Hash
+        $FileEntry.lastKnownHash = $Hash
+    }
+
+    if ($LastModified) {
+        $FileEntry.devices[$DeviceId].lastModified = $LastModified
+    }
+}
+
+# Add version to file history
+function Add-FileVersion {
+    param(
+        [hashtable]$FileEntry,
+        [string]$Hash,
+        [string]$Action,  # "create", "update", "delete"
+        [string]$DeviceId
+    )
+
+    $versionInfo = @{
+        hash = $Hash
+        timestamp = (Get-Date -Format 'o')
+        device = $DeviceId
+        action = $Action
+    }
+
+    $FileEntry.versions += $versionInfo
 
     # Trim to max history
-    if ($FileEntry.versions.Count -gt $script:Config.MaxVersionHistory) {
+    if (@($FileEntry.versions).Count -gt $script:Config.MaxVersionHistory) {
         $FileEntry.versions = $FileEntry.versions | Select-Object -Last $script:Config.MaxVersionHistory
     }
 }
@@ -378,23 +554,25 @@ function Sync-Blueprints {
         }
     }
 
-    # Load metadata
+    # Load metadata (V2.0 file-centric structure)
     $metadata = Get-Metadata
-
-    # Ensure globalFiles exists
-    if (!$metadata.ContainsKey('globalFiles')) {
-        $metadata.globalFiles = @{}
-    }
 
     # Ensure device exists in metadata
     if (!$metadata.devices.ContainsKey($script:Config.DeviceId)) {
         $metadata.devices[$script:Config.DeviceId] = @{
             lastSync = (Get-Date -Format 'o')
-            files = @{}
+            lastKnownFiles = @{}
         }
     }
 
-    $deviceData = $metadata.devices[$script:Config.DeviceId]
+    $deviceInfo = $metadata.devices[$script:Config.DeviceId]
+
+    # Ensure lastKnownFiles property exists (may be missing in older V2.0 metadata)
+    if (!$deviceInfo.ContainsKey('lastKnownFiles')) {
+        $deviceInfo.lastKnownFiles = @{}
+    }
+
+    $previousFiles = $deviceInfo.lastKnownFiles
     $localFiles = @{}
     $oneDriveFiles = @{}
     $syncedCount = 0
@@ -417,6 +595,12 @@ function Sync-Blueprints {
             foreach ($file in $blueprintFiles) {
                 $relativePath = Join-Path $saveName $file.Name
                 $fileHash = Get-FileHashString -FilePath $file.FullName
+
+                # Skip files with hash errors
+                if ($null -eq $fileHash) {
+                    Write-Log "Skipping file due to hash error: $relativePath" -Level Warning
+                    continue
+                }
 
                 $localFiles[$relativePath] = @{
                     fullPath = $file.FullName
@@ -446,6 +630,12 @@ function Sync-Blueprints {
                     $relativePath = Join-Path $saveName $file.Name
                     $fileHash = Get-FileHashString -FilePath $file.FullName
 
+                    # Skip files with hash errors
+                    if ($null -eq $fileHash) {
+                        Write-Log "Skipping OneDrive file due to hash error: $relativePath" -Level Warning
+                        continue
+                    }
+
                     $oneDriveFiles[$relativePath] = @{
                         fullPath = $file.FullName
                         hash = $fileHash
@@ -457,353 +647,304 @@ function Sync-Blueprints {
         }
     }
 
-    # STEP 3: Process all files for bidirectional sync
-    $allFiles = @{}
-
-    # Add all local files
+    # STEP 3: Detect deletions by comparing previous vs current scan
+    $currentFiles = @{}
     foreach ($key in $localFiles.Keys) {
-        $allFiles[$key] = @{ Local = $localFiles[$key]; OneDrive = $null }
+        $currentFiles[$key] = $localFiles[$key].hash
     }
 
-    # Add/update with OneDrive files
-    foreach ($key in $oneDriveFiles.Keys) {
-        if ($allFiles.ContainsKey($key)) {
-            $allFiles[$key].OneDrive = $oneDriveFiles[$key]
-        }
-        else {
-            $allFiles[$key] = @{ Local = $null; OneDrive = $oneDriveFiles[$key] }
+    # Find deleted files (existed before, missing now)
+    $deletedFiles = @()
+    foreach ($prevFile in $previousFiles.Keys) {
+        if (!$currentFiles.ContainsKey($prevFile)) {
+            $deletedFiles += $prevFile
+            Write-Log "Detected deletion: $prevFile"
         }
     }
 
-    # STEP 4: Sync each file
-    foreach ($relativePath in $allFiles.Keys) {
-        $fileInfo = $allFiles[$relativePath]
+    # STEP 4: Process deleted files - mark as deleted and remove from OneDrive immediately
+    $processedDeletions = @()  # Track all files deleted in this step (including companions)
+
+    foreach ($deletedPath in $deletedFiles) {
+        $fileEntry = Get-FileEntry -Metadata $metadata -RelativePath $deletedPath
+
+        # Check if file exists in OneDrive and backup before deletion
+        $oneDrivePath = Join-Path $script:Config.BlueprintsPath $deletedPath
+        if (Test-Path $oneDrivePath) {
+            Write-Log "File deleted locally, removing from OneDrive: $deletedPath"
+
+            # Backup OneDrive version before deletion
+            Backup-FileVersion -SourcePath $oneDrivePath -RelativePath $deletedPath -BackupReason "deletion" | Out-Null
+
+            # Remove from OneDrive
+            Remove-Item -Path $oneDrivePath -Force -ErrorAction SilentlyContinue
+
+            # Handle companion file (.sbp <-> .sbpcfg)
+            $baseName = [System.IO.Path]::GetFileNameWithoutExtension($deletedPath)
+            $extension = [System.IO.Path]::GetExtension($deletedPath)
+            $companionExt = if ($extension -eq '.sbp') { '.sbpcfg' } else { '.sbp' }
+            $companionFile = Join-Path (Split-Path $deletedPath -Parent) "$baseName$companionExt"
+            $companionPath = Join-Path $script:Config.BlueprintsPath $companionFile
+
+            if (Test-Path $companionPath) {
+                Write-Log "Also removing companion file: $companionFile"
+                Backup-FileVersion -SourcePath $companionPath -RelativePath $companionFile -BackupReason "deletion-companion" | Out-Null
+                Remove-Item -Path $companionPath -Force -ErrorAction SilentlyContinue
+
+                # Mark companion as deleted too
+                $companionEntry = Get-FileEntry -Metadata $metadata -RelativePath $companionFile
+                $companionEntry.globalStatus = "deleted"
+                $companionEntry.deletedBy = $script:Config.DeviceId
+                $companionEntry.deletedTimestamp = (Get-Date -Format 'o')
+                Set-DeviceFileStatus -FileEntry $companionEntry -DeviceId $script:Config.DeviceId -Status "deleted"
+
+                # Get companion hash before it was deleted (from previous files if available)
+                $companionHash = if ($previousFiles.ContainsKey($companionFile)) {
+                    $previousFiles[$companionFile]
+                } else {
+                    "unknown"
+                }
+                Add-FileVersion -FileEntry $companionEntry -Hash $companionHash -Action "delete" -DeviceId $script:Config.DeviceId
+
+                # Track companion as processed
+                $processedDeletions += $companionFile
+            }
+        }
+
+        # Mark file as globally deleted
+        $fileEntry.globalStatus = "deleted"
+        $fileEntry.deletedBy = $script:Config.DeviceId
+        $fileEntry.deletedTimestamp = (Get-Date -Format 'o')
+
+        # Update this device's status
+        Set-DeviceFileStatus -FileEntry $fileEntry -DeviceId $script:Config.DeviceId -Status "deleted"
+
+        # Add deletion to version history
+        Add-FileVersion -FileEntry $fileEntry -Hash $previousFiles[$deletedPath] -Action "delete" -DeviceId $script:Config.DeviceId
+
+        # Track this file as processed
+        $processedDeletions += $deletedPath
+
+        $deletedCount++
+    }
+
+    # STEP 5: Process all current files (local and OneDrive)
+    $allCurrentFiles = @{}
+
+    # Add local files
+    foreach ($path in $localFiles.Keys) {
+        $allCurrentFiles[$path] = @{
+            Local = $localFiles[$path]
+            OneDrive = $null
+        }
+    }
+
+    # Add OneDrive files
+    foreach ($path in $oneDriveFiles.Keys) {
+        if ($allCurrentFiles.ContainsKey($path)) {
+            $allCurrentFiles[$path].OneDrive = $oneDriveFiles[$path]
+        } else {
+            $allCurrentFiles[$path] = @{
+                Local = $null
+                OneDrive = $oneDriveFiles[$path]
+            }
+        }
+    }
+
+    # STEP 6: Process each file with file-centric logic
+    foreach ($relativePath in $allCurrentFiles.Keys) {
+        # Skip files that were deleted in this sync session
+        if ($processedDeletions -contains $relativePath) {
+            continue
+        }
+
+        $fileInfo = $allCurrentFiles[$relativePath]
         $saveName = Split-Path $relativePath -Parent
 
-        # Prepare device file entry
-        if (!$deviceData.files.ContainsKey($relativePath)) {
-            $deviceData.files[$relativePath] = @{
-                current = @{}
-                versions = @()
+        # Get or create file entry in file-centric metadata
+        $fileEntry = Get-FileEntry -Metadata $metadata -RelativePath $relativePath
+
+        # Check if this is a new file with same name as a deleted file
+        if ($fileEntry.globalStatus -eq "deleted") {
+            # Check if this is actually a new file (different hash than last known)
+            $isNewFile = $false
+
+            if ($fileInfo.Local -and $fileInfo.Local.hash -ne $fileEntry.lastKnownHash) {
+                $isNewFile = $true
+            }
+            elseif ($fileInfo.OneDrive -and $fileInfo.OneDrive.hash -ne $fileEntry.lastKnownHash) {
+                $isNewFile = $true
+            }
+
+            if ($isNewFile) {
+                Write-Log "New file created with same name as previously deleted file: $relativePath"
+                # Reset to active status - this is a new file lifecycle
+                $fileEntry.globalStatus = "active"
+                $fileEntry.deletedBy = $null
+                $fileEntry.deletedTimestamp = $null
+                $fileEntry.fileId = [System.Guid]::NewGuid().ToString()  # New file ID for new lifecycle
+            }
+            else {
+                # This is the same old deleted file, remove it
+                if ($fileInfo.Local) {
+                    Write-Log "Removing locally found file marked as deleted: $relativePath"
+                    Remove-Item -Path $fileInfo.Local.fullPath -Force -ErrorAction SilentlyContinue
+                }
+                if ($fileInfo.OneDrive) {
+                    Write-Log "Removing OneDrive file marked as deleted: $relativePath"
+                    Backup-FileVersion -SourcePath $fileInfo.OneDrive.fullPath -RelativePath $relativePath -BackupReason "global_deletion"
+                    Remove-Item -Path $fileInfo.OneDrive.fullPath -Force -ErrorAction SilentlyContinue
+                }
+                continue
             }
         }
 
-        $deviceFileEntry = $deviceData.files[$relativePath]
-
-        # Determine sync action
+        # Process file based on where it exists
         if ($fileInfo.Local -and $fileInfo.OneDrive) {
-            # File exists in both locations
-            $localPath = $fileInfo.Local.fullPath
-            $oneDrivePath = $fileInfo.OneDrive.fullPath
+            # File exists in both locations - check if they're different
+            if ($fileInfo.Local.hash -eq $fileInfo.OneDrive.hash) {
+                Write-Log "File $relativePath : Files are identical"
 
-            $comparison = Compare-FileVersions `
-                -LocalPath $localPath `
-                -OneDrivePath $oneDrivePath `
-                -LocalHash $fileInfo.Local.hash `
-                -OneDriveHash $fileInfo.OneDrive.hash
-
-            Write-Log "File $relativePath : $($comparison.Reason)"
-
-            switch ($comparison.Direction) {
-                'LocalToCloud' {
-                    if ($script:Config.SyncMode -ne 'CloudToLocal') {
-                        # Backup OneDrive version before overwrite
-                        $backupPath = Backup-FileVersion `
-                            -SourcePath $oneDrivePath `
-                            -RelativePath $relativePath `
-                            -BackupReason "overwrite"
-
-                        # Add to version history
-                        if ($backupPath) {
-                            $versionInfo = Get-FileVersionInfo `
-                                -FilePath $oneDrivePath `
-                                -Hash $fileInfo.OneDrive.hash `
-                                -Action "overwrite" `
-                                -BackupPath $backupPath
-                            Add-ToVersionHistory -FileEntry $deviceFileEntry -VersionInfo $versionInfo
-                        }
-
-                        # Copy local to OneDrive preserving timestamps
-                        try {
-                            $sourceItem = Get-Item $localPath
-                            Copy-Item -Path $localPath -Destination $oneDrivePath -Force
-
-                            # Preserve timestamps
-                            $destItem = Get-Item $oneDrivePath
-                            $destItem.CreationTime = $sourceItem.CreationTime
-                            $destItem.LastWriteTime = $sourceItem.LastWriteTime
-                            $destItem.LastAccessTime = $sourceItem.LastAccessTime
-
-                            Write-Log "Pushed to OneDrive: $relativePath"
-                            $syncedCount++
-                        }
-                        catch {
-                            Write-Log "Error pushing $relativePath to OneDrive: $_" -Level Error
-                        }
-                    }
-                }
-                'CloudToLocal' {
-                    if ($script:Config.SyncMode -ne 'LocalToCloud') {
-                        # Ensure local directory exists
-                        $localDir = Join-Path $script:Config.SourcePath $saveName
-                        if (!(Test-Path $localDir)) {
-                            New-Item -Path $localDir -ItemType Directory -Force | Out-Null
-                        }
-
-                        $localPath = Join-Path $script:Config.SourcePath $relativePath
-
-                        # Backup local version before overwrite
-                        if (Test-Path $localPath) {
-                            $backupPath = Backup-FileVersion `
-                                -SourcePath $localPath `
-                                -RelativePath $relativePath `
-                                -BackupReason "overwrite"
-
-                            # Add to version history
-                            if ($backupPath) {
-                                $versionInfo = Get-FileVersionInfo `
-                                    -FilePath $localPath `
-                                    -Hash $fileInfo.Local.hash `
-                                    -Action "overwrite" `
-                                    -BackupPath $backupPath
-                                Add-ToVersionHistory -FileEntry $deviceFileEntry -VersionInfo $versionInfo
-                            }
-                        }
-
-                        # Copy OneDrive to local preserving timestamps
-                        try {
-                            $sourceItem = Get-Item $oneDrivePath
-                            Copy-Item -Path $oneDrivePath -Destination $localPath -Force
-
-                            # Preserve timestamps
-                            $destItem = Get-Item $localPath
-                            $destItem.CreationTime = $sourceItem.CreationTime
-                            $destItem.LastWriteTime = $sourceItem.LastWriteTime
-                            $destItem.LastAccessTime = $sourceItem.LastAccessTime
-
-                            Write-Log "Pulled from OneDrive: $relativePath"
-                            $pulledCount++
-                        }
-                        catch {
-                            Write-Log "Error pulling $relativePath from OneDrive: $_" -Level Error
-                        }
-                    }
-                }
+                # Update device status to active
+                Set-DeviceFileStatus -FileEntry $fileEntry -DeviceId $script:Config.DeviceId -Status "active" -Hash $fileInfo.Local.hash -LastModified $fileInfo.Local.lastModified
             }
+            else {
+                # Files differ - determine which is newer
+                $localTime = [DateTime]::Parse($fileInfo.Local.lastModified)
+                $oneDriveTime = [DateTime]::Parse($fileInfo.OneDrive.lastModified)
 
-            # Update current version info
-            $currentHash = if ($comparison.Direction -eq 'CloudToLocal') { $fileInfo.OneDrive.hash } else { $fileInfo.Local.hash }
-            $deviceFileEntry.current = @{
-                hash = $currentHash
-                lastModified = (Get-Date).ToString('o')
-                size = if ($fileInfo.Local) { $fileInfo.Local.size } else { $fileInfo.OneDrive.size }
+                if ($localTime -gt $oneDriveTime) {
+                    Write-Log "CONFLICT RESOLVED: Local file is newer, backing up OneDrive version: $relativePath" -Level Warning
+                    # Backup OneDrive version (the "losing" file in conflict)
+                    Backup-FileVersion -SourcePath $fileInfo.OneDrive.fullPath -RelativePath $relativePath -BackupReason "conflict_resolution" | Out-Null
+                    # Push local to OneDrive
+                    if (Copy-FileWithTimestamps -SourcePath $fileInfo.Local.fullPath -DestinationPath $fileInfo.OneDrive.fullPath) {
+                        Set-DeviceFileStatus -FileEntry $fileEntry -DeviceId $script:Config.DeviceId -Status "active" -Hash $fileInfo.Local.hash -LastModified $fileInfo.Local.lastModified
+                        Add-FileVersion -FileEntry $fileEntry -Hash $fileInfo.Local.hash -Action "conflict_win" -DeviceId $script:Config.DeviceId
+                        $syncedCount++
+                    }
+                }
+                elseif ($oneDriveTime -gt $localTime) {
+                    Write-Log "CONFLICT RESOLVED: OneDrive file is newer, backing up local version: $relativePath" -Level Warning
+                    # Backup local version (the "losing" file in conflict)
+                    Backup-FileVersion -SourcePath $fileInfo.Local.fullPath -RelativePath $relativePath -BackupReason "conflict_resolution" | Out-Null
+                    # Pull OneDrive to local
+                    if (Copy-FileWithTimestamps -SourcePath $fileInfo.OneDrive.fullPath -DestinationPath $fileInfo.Local.fullPath) {
+                        Set-DeviceFileStatus -FileEntry $fileEntry -DeviceId $script:Config.DeviceId -Status "active" -Hash $fileInfo.OneDrive.hash -LastModified $fileInfo.OneDrive.lastModified
+                        Add-FileVersion -FileEntry $fileEntry -Hash $fileInfo.OneDrive.hash -Action "conflict_win" -DeviceId $script:Config.DeviceId
+                        $pulledCount++
+                    }
+                }
+                else {
+                    # Same timestamp but different content - backup local, prefer OneDrive
+                    Write-Log "CONFLICT RESOLVED: Same timestamp, different content. Backing up local, preferring OneDrive: $relativePath" -Level Warning
+                    Backup-FileVersion -SourcePath $fileInfo.Local.fullPath -RelativePath $relativePath -BackupReason "timestamp_conflict" | Out-Null
+                    if (Copy-FileWithTimestamps -SourcePath $fileInfo.OneDrive.fullPath -DestinationPath $fileInfo.Local.fullPath) {
+                        Set-DeviceFileStatus -FileEntry $fileEntry -DeviceId $script:Config.DeviceId -Status "active" -Hash $fileInfo.OneDrive.hash -LastModified $fileInfo.OneDrive.lastModified
+                        Add-FileVersion -FileEntry $fileEntry -Hash $fileInfo.OneDrive.hash -Action "conflict_win" -DeviceId $script:Config.DeviceId
+                        $pulledCount++
+                    }
+                }
             }
         }
         elseif ($fileInfo.Local -and !$fileInfo.OneDrive) {
-            # File only exists locally
+            # File only exists locally - push to OneDrive (if not CloudToLocal mode)
             if ($script:Config.SyncMode -ne 'CloudToLocal') {
-                # Create OneDrive directory if needed
+                Write-Log "New file pushed to OneDrive: $relativePath"
                 $oneDriveDir = Join-Path $script:Config.BlueprintsPath $saveName
-                if (!(Test-Path $oneDriveDir)) {
-                    New-Item -Path $oneDriveDir -ItemType Directory -Force | Out-Null
+                if (!(Test-Path $oneDriveDir)) { New-Item -Path $oneDriveDir -ItemType Directory -Force | Out-Null }
+                $oneDrivePath = Join-Path $oneDriveDir (Split-Path $relativePath -Leaf)
+
+                # Check if file already exists and backup if needed
+                if (Test-Path $oneDrivePath) {
+                    Backup-FileVersion -SourcePath $oneDrivePath -RelativePath $relativePath -BackupReason "new_file_overwrite" | Out-Null
                 }
 
-                $oneDrivePath = Join-Path $script:Config.BlueprintsPath $relativePath
-                $localPath = $fileInfo.Local.fullPath
-
-                try {
-                    $sourceItem = Get-Item $localPath
-                    Copy-Item -Path $localPath -Destination $oneDrivePath -Force
-
-                    # Preserve timestamps
-                    $destItem = Get-Item $oneDrivePath
-                    $destItem.CreationTime = $sourceItem.CreationTime
-                    $destItem.LastWriteTime = $sourceItem.LastWriteTime
-                    $destItem.LastAccessTime = $sourceItem.LastAccessTime
-
-                    Write-Log "New file pushed to OneDrive: $relativePath"
+                # Copy with timestamp preservation
+                if (Copy-FileWithTimestamps -SourcePath $fileInfo.Local.fullPath -DestinationPath $oneDrivePath) {
+                    Set-DeviceFileStatus -FileEntry $fileEntry -DeviceId $script:Config.DeviceId -Status "active" -Hash $fileInfo.Local.hash -LastModified $fileInfo.Local.lastModified
+                    Add-FileVersion -FileEntry $fileEntry -Hash $fileInfo.Local.hash -Action "create" -DeviceId $script:Config.DeviceId
                     $syncedCount++
-                }
-                catch {
-                    Write-Log "Error pushing new file $relativePath : $_" -Level Error
-                }
-
-                # Update current version info
-                $deviceFileEntry.current = @{
-                    hash = $fileInfo.Local.hash
-                    lastModified = $fileInfo.Local.lastModified
-                    size = $fileInfo.Local.size
                 }
             }
         }
         elseif (!$fileInfo.Local -and $fileInfo.OneDrive) {
-            # File only exists in OneDrive
+            # File only exists in OneDrive - pull to local (if not LocalToCloud mode)
             if ($script:Config.SyncMode -ne 'LocalToCloud') {
-                # Create local directory if needed
+                Write-Log "New file pulled from OneDrive: $relativePath"
                 $localDir = Join-Path $script:Config.SourcePath $saveName
-                if (!(Test-Path $localDir)) {
-                    New-Item -Path $localDir -ItemType Directory -Force | Out-Null
+                if (!(Test-Path $localDir)) { New-Item -Path $localDir -ItemType Directory -Force | Out-Null }
+                $localPath = Join-Path $localDir (Split-Path $relativePath -Leaf)
+
+                # Check if file already exists locally and backup if needed
+                if (Test-Path $localPath) {
+                    Backup-FileVersion -SourcePath $localPath -RelativePath $relativePath -BackupReason "new_file_overwrite" | Out-Null
                 }
 
-                $localPath = Join-Path $script:Config.SourcePath $relativePath
-                $oneDrivePath = $fileInfo.OneDrive.fullPath
-
-                try {
-                    $sourceItem = Get-Item $oneDrivePath
-                    Copy-Item -Path $oneDrivePath -Destination $localPath -Force
-
-                    # Preserve timestamps
-                    $destItem = Get-Item $localPath
-                    $destItem.CreationTime = $sourceItem.CreationTime
-                    $destItem.LastWriteTime = $sourceItem.LastWriteTime
-                    $destItem.LastAccessTime = $sourceItem.LastAccessTime
-
-                    Write-Log "New file pulled from OneDrive: $relativePath"
+                # Copy with timestamp preservation
+                if (Copy-FileWithTimestamps -SourcePath $fileInfo.OneDrive.fullPath -DestinationPath $localPath) {
+                    Set-DeviceFileStatus -FileEntry $fileEntry -DeviceId $script:Config.DeviceId -Status "active" -Hash $fileInfo.OneDrive.hash -LastModified $fileInfo.OneDrive.lastModified
+                    Add-FileVersion -FileEntry $fileEntry -Hash $fileInfo.OneDrive.hash -Action "create" -DeviceId $script:Config.DeviceId
                     $pulledCount++
                 }
-                catch {
-                    Write-Log "Error pulling new file $relativePath : $_" -Level Error
-                }
-
-                # Update current version info
-                $deviceFileEntry.current = @{
-                    hash = $fileInfo.OneDrive.hash
-                    lastModified = $fileInfo.OneDrive.lastModified
-                    size = $fileInfo.OneDrive.size
-                }
-            }
-        }
-
-        # Update global file tracking
-        if ($deviceFileEntry.current.hash) {
-            $metadata.globalFiles[$relativePath] = @{
-                latestHash = $deviceFileEntry.current.hash
-                latestModified = $deviceFileEntry.current.lastModified
-                latestDevice = $script:Config.DeviceId
             }
         }
     }
 
-    # STEP 5: Check for deletions (files in metadata but not in current scan)
-    $filesToDelete = @()
-    foreach ($trackedFile in $deviceData.files.Keys) {
-        $stillExists = $false
+    # STEP 7: Handle cross-device deletion propagation (only for files not processed in current session)
+    foreach ($filePath in $metadata.files.Keys) {
+        $fileEntry = $metadata.files[$filePath]
 
-        # Check if file still exists locally or in OneDrive based on sync mode
-        if ($script:Config.SyncMode -eq 'LocalToCloud' -or $script:Config.SyncMode -eq 'Bidirectional') {
-            if ($localFiles.ContainsKey($trackedFile)) {
-                $stillExists = $true
-            }
-        }
-        if ($script:Config.SyncMode -eq 'CloudToLocal' -or $script:Config.SyncMode -eq 'Bidirectional') {
-            if ($oneDriveFiles.ContainsKey($trackedFile)) {
-                $stillExists = $true
-            }
-        }
-
-        if (!$stillExists) {
-            $filesToDelete += $trackedFile
-        }
-    }
-
-    # Process deletions
-    foreach ($deletedFile in $filesToDelete) {
-        Write-Log "File deleted: $deletedFile"
-
-        # Check if file exists in OneDrive for backup
-        $oneDrivePath = Join-Path $script:Config.BlueprintsPath $deletedFile
-        if (Test-Path $oneDrivePath) {
-            # Check if any other device still has this file
-            $otherDevicesHaveFile = $false
-            foreach ($deviceId in $metadata.devices.Keys) {
-                if ($deviceId -ne $script:Config.DeviceId) {
-                    $otherDevice = $metadata.devices[$deviceId]
-                    if ($otherDevice.files.ContainsKey($deletedFile)) {
-                        # Check if the other device's version is current (not deleted)
-                        if ($otherDevice.files[$deletedFile].current.hash) {
-                            $otherDevicesHaveFile = $true
-                            break
-                        }
-                    }
-                }
+        # If file is globally deleted, ensure it's removed from all devices
+        if ($fileEntry.globalStatus -eq "deleted") {
+            # Skip files that were deleted in this sync session (already handled in STEP 4)
+            if ($processedDeletions -contains $filePath) {
+                continue
             }
 
-            if (!$otherDevicesHaveFile) {
-                # No other device has this file, safe to backup and remove
-                $backupPath = Backup-FileVersion `
-                    -SourcePath $oneDrivePath `
-                    -RelativePath $deletedFile `
-                    -BackupReason "deletion"
+            # Check if this device still has the file and remove it
+            $localPath = Join-Path $script:Config.SourcePath $filePath
+            $oneDrivePath = Join-Path $script:Config.BlueprintsPath $filePath
 
-                # Add deletion to version history
-                if ($backupPath -and $deviceData.files.ContainsKey($deletedFile)) {
-                    $fileEntry = $deviceData.files[$deletedFile]
-                    $versionInfo = Get-FileVersionInfo `
-                        -FilePath $oneDrivePath `
-                        -Hash (Get-FileHashString -FilePath $oneDrivePath) `
-                        -Action "deletion" `
-                        -BackupPath $backupPath
-                    Add-ToVersionHistory -FileEntry $fileEntry -VersionInfo $versionInfo
+            if (Test-Path $localPath) {
+                Write-Log "Removing locally found file marked as globally deleted: $filePath"
+                Remove-Item -Path $localPath -Force -ErrorAction SilentlyContinue
+            }
 
-                    # Clear current version to indicate deletion
-                    $fileEntry.current = @{}
-                }
-
-                # Remove the file from OneDrive
-                Remove-Item -Path $oneDrivePath -Force
+            if (Test-Path $oneDrivePath) {
+                Write-Log "Removing OneDrive file marked as globally deleted by another device: $filePath"
+                # Backup since this is from another device's deletion
+                Backup-FileVersion -SourcePath $oneDrivePath -RelativePath $filePath -BackupReason "cross_device_deletion" | Out-Null
+                Remove-Item -Path $oneDrivePath -Force -ErrorAction SilentlyContinue
                 $deletedCount++
-
-                # Also handle the corresponding .sbpcfg or .sbp file
-                $baseName = [System.IO.Path]::GetFileNameWithoutExtension($deletedFile)
-                $extension = [System.IO.Path]::GetExtension($deletedFile)
-                $companionExt = if ($extension -eq '.sbp') { '.sbpcfg' } else { '.sbp' }
-                $companionFile = Join-Path (Split-Path $deletedFile -Parent) "$baseName$companionExt"
-                $companionPath = Join-Path $script:Config.BlueprintsPath $companionFile
-
-                if (Test-Path $companionPath) {
-                    Backup-FileVersion `
-                        -SourcePath $companionPath `
-                        -RelativePath $companionFile `
-                        -BackupReason "deletion-companion"
-                    Remove-Item -Path $companionPath -Force
-                }
-
-                # Remove from global files
-                if ($metadata.globalFiles.ContainsKey($deletedFile)) {
-                    $metadata.globalFiles.Remove($deletedFile)
-                }
-                if ($metadata.globalFiles.ContainsKey($companionFile)) {
-                    $metadata.globalFiles.Remove($companionFile)
-                }
-            }
-            else {
-                Write-Log "File still exists on other devices, keeping in OneDrive: $deletedFile"
-                # Just mark as deleted on this device
-                if ($deviceData.files.ContainsKey($deletedFile)) {
-                    $deviceData.files[$deletedFile].current = @{}
-                }
-            }
-        }
-        else {
-            # File already removed from OneDrive, just update metadata
-            if ($deviceData.files.ContainsKey($deletedFile)) {
-                $deviceData.files[$deletedFile].current = @{}
             }
         }
     }
 
-    # Update device metadata
-    $deviceData.lastSync = (Get-Date -Format 'o')
+    # STEP 8: Update device's lastKnownFiles for next sync comparison
+    $deviceInfo.lastKnownFiles = @{}
+    foreach ($path in $localFiles.Keys) {
+        $deviceInfo.lastKnownFiles[$path] = $localFiles[$path].hash
+    }
 
-    # Save metadata
-    Save-Metadata -Metadata $metadata
+    # STEP 9: Update device sync timestamp
+    $deviceInfo.lastSync = (Get-Date -Format 'o')
+
+    # Save metadata with atomic operation
+    try {
+        Save-Metadata -Metadata $metadata
+    }
+    catch {
+        Write-Log "CRITICAL: Failed to save metadata. Sync state may be inconsistent: $_" -Level Error
+        throw "Metadata save failed - sync state compromised"
+    }
 
     # Clean up empty save folders in both locations
     if ($script:Config.SyncMode -ne 'CloudToLocal') {
         $localSaveFolders = Get-ChildItem -Path $script:Config.SourcePath -Directory -ErrorAction SilentlyContinue
         foreach ($folder in $localSaveFolders) {
             $files = Get-ChildItem -Path $folder.FullName -File -ErrorAction SilentlyContinue
-            if ($files.Count -eq 0) {
+            if (@($files).Count -eq 0) {
                 Remove-Item -Path $folder.FullName -Force
                 Write-Log "Removed empty local folder: $($folder.Name)"
             }
@@ -811,12 +952,14 @@ function Sync-Blueprints {
     }
 
     if ($script:Config.SyncMode -ne 'LocalToCloud') {
-        $oneDriveSaveFolders = Get-ChildItem -Path $script:Config.BlueprintsPath -Directory -ErrorAction SilentlyContinue
-        foreach ($folder in $oneDriveSaveFolders) {
-            $files = Get-ChildItem -Path $folder.FullName -File -ErrorAction SilentlyContinue
-            if ($files.Count -eq 0) {
-                Remove-Item -Path $folder.FullName -Force
-                Write-Log "Removed empty OneDrive folder: $($folder.Name)"
+        if (Test-Path $script:Config.BlueprintsPath) {
+            $oneDriveSaveFolders = Get-ChildItem -Path $script:Config.BlueprintsPath -Directory -ErrorAction SilentlyContinue
+            foreach ($folder in $oneDriveSaveFolders) {
+                $files = Get-ChildItem -Path $folder.FullName -File -ErrorAction SilentlyContinue
+                if (@($files).Count -eq 0) {
+                    Remove-Item -Path $folder.FullName -Force
+                    Write-Log "Removed empty OneDrive folder: $($folder.Name)"
+                }
             }
         }
     }
